@@ -26,10 +26,10 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: 检出当前基准分支上的工作流文件
+      - name: 检出默认分支上的自动化脚本
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
           persist-credentials: false
 

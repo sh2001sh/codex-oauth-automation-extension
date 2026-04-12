@@ -10,7 +10,7 @@ const DEFAULT_TARGET_BRANCH = 'dev';
 const DEFAULT_MAX_FILES = 40;
 const DEFAULT_MAX_PATCH_CHARS_PER_FILE = 12000;
 const DEFAULT_MAX_PATCH_CHARS_TOTAL = 120000;
-const DEFAULT_TRUSTED_ASSOCIATIONS = ['COLLABORATOR', 'CONTRIBUTOR', 'MEMBER', 'OWNER'];
+const DEFAULT_TRUSTED_ASSOCIATIONS = [];
 
 class ReviewBlockedError extends Error {
   constructor(message) {
@@ -36,7 +36,21 @@ async function main() {
 
   if (currentBaseRef !== targetBranch) {
     if (currentBaseRef === 'master') {
-      await retargetPullRequest(repo, prNumber, targetBranch);
+      const retargetResult = await retargetPullRequest(repo, pr, targetBranch);
+      if (retargetResult.status === 'duplicate') {
+        await upsertManagedComment(
+          repo,
+          prNumber,
+          renderDuplicateTargetPrComment({
+            targetBranch,
+            duplicatePrNumber: retargetResult.pull.number
+          })
+        );
+        await appendSummary(
+          `PR #${prNumber} 没有自动转到 ${targetBranch}，因为已存在同源分支的 PR #${retargetResult.pull.number} 指向 ${targetBranch}。`
+        );
+        return;
+      }
       await upsertManagedComment(
         repo,
         prNumber,
@@ -336,13 +350,51 @@ async function ensureBranchExists(repo, branchName) {
   await githubRequest(`/repos/${repo}/branches/${encodeURIComponent(branchName)}`);
 }
 
-async function retargetPullRequest(repo, prNumber, targetBranch) {
-  await githubRequest(`/repos/${repo}/pulls/${prNumber}`, {
-    method: 'PATCH',
-    body: JSON.stringify({
-      base: targetBranch
-    })
-  });
+async function listOpenPullRequestsByHeadAndBase(repo, headOwner, headRef, baseRef) {
+  const query = [
+    'state=open',
+    `head=${encodeURIComponent(`${headOwner}:${headRef}`)}`,
+    `base=${encodeURIComponent(baseRef)}`,
+    'per_page=100'
+  ].join('&');
+  return githubRequestJson(`/repos/${repo}/pulls?${query}`);
+}
+
+async function retargetPullRequest(repo, pr, targetBranch) {
+  try {
+    await githubRequest(`/repos/${repo}/pulls/${pr.number}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        base: targetBranch
+      })
+    });
+    return { status: 'retargeted' };
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (!message.includes('(422)') || !message.includes("A pull request already exists for base branch")) {
+      throw error;
+    }
+
+    const headOwner = String(pr.head?.repo?.owner?.login || '').trim();
+    const headRef = String(pr.head?.ref || '').trim();
+    if (!headOwner || !headRef) {
+      throw error;
+    }
+
+    const pulls = await listOpenPullRequestsByHeadAndBase(repo, headOwner, headRef, targetBranch);
+    const duplicatePull = Array.isArray(pulls)
+      ? pulls.find((pull) => Number(pull.number) !== Number(pr.number))
+      : null;
+
+    if (!duplicatePull) {
+      throw error;
+    }
+
+    return {
+      status: 'duplicate',
+      pull: duplicatePull
+    };
+  }
 }
 
 function buildReviewInput({ repo, pr, files, maxFiles, maxPatchCharsPerFile, maxPatchCharsTotal }) {
@@ -638,6 +690,21 @@ function renderRetargetedComment({ fromBranch, targetBranch }) {
     `后续自动审查和自动合并都只会针对 \`${targetBranch}\` 进行，\`master\` 不会被自动合并。`,
     '',
     'GitHub 重新计算差异后，工作流会再次运行。'
+  ];
+
+  return `${lines.join('\n').trim()}\n`;
+}
+
+function renderDuplicateTargetPrComment({ targetBranch, duplicatePrNumber }) {
+  const lines = [
+    MARKER,
+    '## 已存在对应的开发分支 PR',
+    '',
+    `系统原本想把这个 PR 自动转到 \`${targetBranch}\`，但同一个来源分支已经有一个指向 \`${targetBranch}\` 的 PR：#${duplicatePrNumber}。`,
+    '',
+    `为了避免重复 PR 混淆，本次没有继续自动转向，也没有执行自动合并。`,
+    '',
+    `请优先处理已有的 PR #${duplicatePrNumber}，或者手动关闭其中一个重复 PR。`
   ];
 
   return `${lines.join('\n').trim()}\n`;
